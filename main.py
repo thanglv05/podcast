@@ -11,8 +11,8 @@ import os
 
 app = FastAPI(
     title="LinkGrabber API",
-    description="Extract and filter links from any URL",
-    version="1.0.0",
+    description="Extract and filter links from any URL. Use `js=true` for JavaScript-rendered pages (Spotify, Twitter, etc.)",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -35,7 +35,7 @@ async def _keep_alive_loop():
                 await client.get(f"{self_url}/ping", timeout=10)
             except Exception:
                 pass
-            await asyncio.sleep(600)  # Ping mỗi 10 phút
+            await asyncio.sleep(600)
 
 @app.on_event("startup")
 async def startup_event():
@@ -51,11 +51,12 @@ class LinkItem(BaseModel):
 
 class GrabResponse(BaseModel):
     url: str
+    js_mode: bool
     total: int
     filtered: int
     links: list[LinkItem]
 
-# ─── Helper ────────────────────────────────────────────────────────────────────
+# ─── Helpers ───────────────────────────────────────────────────────────────────
 
 HEADERS = {
     "User-Agent": (
@@ -74,26 +75,53 @@ def extract_links(html: str, base_url: str) -> list[LinkItem]:
         raw = tag["href"].strip()
         if not raw or raw.startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-
-        # Resolve relative URLs
         full = urljoin(base_url, raw)
-
-        # Deduplicate
         if full in seen:
             continue
         seen.add(full)
-
         links.append(LinkItem(
             href=full,
             text=" ".join(tag.get_text().split()) or "",
             title=tag.get("title") or None,
             rel=tag.get("rel", [None])[0] if tag.get("rel") else None,
         ))
-
     return links
+
+async def fetch_with_httpx(url: str, timeout: int) -> str:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        resp = await client.get(url, headers=HEADERS)
+        resp.raise_for_status()
+        return resp.text, str(resp.url)
+
+async def fetch_with_playwright(url: str, timeout: int) -> tuple[str, str]:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ]
+        )
+        context = await browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+        # Cuộn xuống để trigger lazy-load
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(2000)
+        html = await page.content()
+        final_url = page.url
+        await browser.close()
+        return html, final_url
 
 def apply_filters(
     links: list[LinkItem],
+    base_url: str,
     contains: Optional[str],
     starts_with: Optional[str],
     ends_with: Optional[str],
@@ -103,7 +131,6 @@ def apply_filters(
     exclude: Optional[str],
 ) -> list[LinkItem]:
     result = links
-
     if contains:
         result = [l for l in result if contains.lower() in l.href.lower()]
     if starts_with:
@@ -120,6 +147,7 @@ def apply_filters(
             raise HTTPException(status_code=400, detail=f"Invalid regex: {regex}")
     if link_type:
         lt = link_type.lower()
+        base_domain = urlparse(base_url).netloc
         if lt == "image":
             result = [l for l in result if re.search(r"\.(jpe?g|png|gif|webp|svg|bmp)(\?|$)", l.href, re.I)]
         elif lt == "document":
@@ -129,21 +157,18 @@ def apply_filters(
         elif lt == "audio":
             result = [l for l in result if re.search(r"\.(mp3|wav|ogg|flac|m4a)(\?|$)", l.href, re.I)]
         elif lt == "internal":
-            base_domain = urlparse(links[0].href).netloc if links else ""
             result = [l for l in result if urlparse(l.href).netloc == base_domain]
         elif lt == "external":
-            base_domain = urlparse(links[0].href).netloc if links else ""
             result = [l for l in result if urlparse(l.href).netloc != base_domain]
     if exclude:
         result = [l for l in result if exclude.lower() not in l.href.lower()]
-
     return result
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 def root():
-    return {"status": "ok", "message": "LinkGrabber API is running 🚀"}
+    return {"status": "ok", "message": "LinkGrabber API is running 🚀", "version": "2.0.0"}
 
 @app.get("/ping", tags=["Health"])
 def ping():
@@ -152,47 +177,47 @@ def ping():
 @app.get("/grab", response_model=GrabResponse, tags=["Links"])
 async def grab_links(
     url: str = Query(..., description="Target URL to extract links from"),
+    js: bool = Query(False, description="Use headless browser for JS-rendered pages (Spotify, Twitter, etc.)"),
+    wait: int = Query(2, ge=1, le=10, description="Extra wait time in seconds after page load (js mode only)"),
     contains: Optional[str] = Query(None, description="Only links containing this string"),
     starts_with: Optional[str] = Query(None, description="Only links starting with this string"),
     ends_with: Optional[str] = Query(None, description="Only links ending with this string"),
-    domain: Optional[str] = Query(None, description="Only links from this exact domain (e.g. example.com)"),
+    domain: Optional[str] = Query(None, description="Only links from this exact domain"),
     regex: Optional[str] = Query(None, description="Filter by regex pattern"),
-    link_type: Optional[str] = Query(None, description="Filter by type: image | document | video | audio | internal | external"),
+    link_type: Optional[str] = Query(None, description="image | document | video | audio | internal | external"),
     exclude: Optional[str] = Query(None, description="Exclude links containing this string"),
-    timeout: int = Query(15, ge=3, le=60, description="Request timeout in seconds"),
+    timeout: int = Query(30, ge=5, le=60, description="Request timeout in seconds"),
 ):
     """
     Fetch a URL and return all links found on the page.
-    Apply one or more filters to narrow down results.
+
+    - **js=false** (default): nhanh, dùng cho trang tĩnh
+    - **js=true**: dùng headless Chromium, lấy được links trên trang render bằng JS (Spotify, Twitter, React apps...)
     """
-    # Validate URL
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
 
-    # Fetch page
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            resp = await client.get(url, headers=HEADERS)
-            resp.raise_for_status()
+        if js:
+            html, final_url = await fetch_with_playwright(url, timeout)
+        else:
+            html, final_url = await fetch_with_httpx(url, timeout)
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail=f"Request timed out after {timeout}s")
+        raise HTTPException(status_code=504, detail=f"Timed out after {timeout}s")
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Extract
-    all_links = extract_links(resp.text, str(resp.url))
-
-    # Filter
-    filtered = apply_filters(
-        all_links, contains, starts_with, ends_with,
-        domain, regex, link_type, exclude
-    )
+    all_links = extract_links(html, final_url)
+    filtered = apply_filters(all_links, final_url, contains, starts_with, ends_with, domain, regex, link_type, exclude)
 
     return GrabResponse(
         url=url,
+        js_mode=js,
         total=len(all_links),
         filtered=len(filtered),
         links=filtered,

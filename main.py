@@ -95,6 +95,10 @@ async def fetch_with_httpx(url: str, timeout: int) -> str:
 
 async def fetch_with_playwright(url: str, timeout: int) -> tuple[str, str]:
     from playwright.async_api import async_playwright
+    # Set đúng path browser trên Render
+    bp = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "")
+    if bp:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bp
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,

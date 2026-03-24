@@ -2,8 +2,10 @@ services:
   - type: web
     name: linkgrabber-api
     runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium && python -m playwright install-deps chromium
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/.playwright
